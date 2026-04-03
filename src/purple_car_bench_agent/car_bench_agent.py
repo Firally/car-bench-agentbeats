@@ -7,8 +7,10 @@ This is the agent being tested. It:
 3. Returns responses in the expected JSON format wrapped in <json>...</json> tags
 """
 import argparse
+import asyncio
 import json
 import os
+import time
 from pathlib import Path
 import sys
 import uvicorn
@@ -74,7 +76,9 @@ class CARBenchAgentExecutor(AgentExecutor):
                         system_prompt = parts[0].replace("System:", "").strip()
                         user_message_text = parts[1].strip()
                         if not messages:  # Only add system prompt once
-                            messages.append({"role": "system", "content": system_prompt})
+                            # Append minimal guidance after the original policies
+                            enhanced_prompt = system_prompt + "\n\nIMPORTANT: Only use tools and parameters that are explicitly available to you. If a required tool or parameter is missing, honestly tell the user you cannot perform that action. Never fabricate capabilities."
+                            messages.append({"role": "system", "content": enhanced_prompt})
                     else:
                         # Regular user message
                         user_message_text = text
@@ -174,7 +178,7 @@ class CARBenchAgentExecutor(AgentExecutor):
             # Regular user message
             messages.append({"role": "user", "content": user_message_text})
 
-        # Call LLM with native tool calling
+        # Call LLM with native tool calling and retry logic
         try:
             # Configure prompt caching (guard against empty lists)
             if tools:
@@ -219,11 +223,29 @@ class CARBenchAgentExecutor(AgentExecutor):
                                     "anthropic-beta": "interleaved-thinking-2025-05-14"
                                 }
 
+            # Retry logic for rate limits
+            max_retries = 3
+            response = None
+            for attempt in range(max_retries):
+                try:
+                    response = completion(
+                        messages=messages,
+                        **completion_kwargs
+                    )
+                    break  # Success, exit retry loop
+                except Exception as retry_err:
+                    error_str = str(retry_err).lower()
+                    if "rate_limit" in error_str or "rate limit" in error_str or "429" in error_str:
+                        wait_time = (attempt + 1) * 2  # 2s, 4s, 6s
+                        ctx_logger.warning(
+                            f"Rate limit hit, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})"
+                        )
+                        await asyncio.sleep(wait_time)
+                    else:
+                        raise  # Non-rate-limit error, don't retry
 
-            response = completion(
-                messages=messages,
-                **completion_kwargs
-            )
+            if response is None:
+                raise Exception("Max retries exceeded due to rate limiting")
             
             # Get the message from LLM
             llm_message = response.choices[0].message

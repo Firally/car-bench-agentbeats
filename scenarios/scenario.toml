@@ -5,17 +5,20 @@ cmd = "python src/green_car_bench_agent/server.py --host 127.0.0.1 --port 8081"
 [[participants]]
 role = "agent"
 endpoint = "http://127.0.0.1:8080"
-cmd = "python src/purple_car_bench_agent/server.py --host 127.0.0.1 --port 8080 --agent-llm claude-opus-4-5-20251101 --temperature 1.0 --thinking --reasoning-effort medium --interleaved-thinking"
+cmd = "python src/purple_car_bench_agent/server.py --host 127.0.0.1 --port 8080 --agent-llm gpt-4o --temperature 0.0"
 
 [config]
-num_trials = 3
+num_trials = 1
 task_split = "test"  # "train" or "test"
-# Specify number of tasks to run (first N tasks) or use task_id_filter for specific tasks
-tasks_base_num_tasks = 2 # First N tasks in type/split, -1 for all.
-tasks_hallucination_num_tasks = 0 # First N tasks in type/split, -1 for all.
-tasks_disambiguation_num_tasks = 0 # First N tasks in type/split, -1 for all.
-# Alternative: Run specific task IDs, priority over num_tasks. Have to be in the correct type/split (check task_split.json)
-# tasks_base_task_id_filter = ["base_0", "base_2"]
-# tasks_hallucination_task_id_filter = ["hallucination_0"]
-# tasks_disambiguation_task_id_filter = ["disambiguation_0"]
+# Larger test: 10 base + 5 hallucination + 5 disambiguation = 20 tasks
+tasks_base_num_tasks = 10
+tasks_hallucination_num_tasks = 5
+tasks_disambiguation_num_tasks = 5
 max_steps = 50
+
+# Green agent LLM settings (user simulator + policy evaluator)
+user_model = "gpt-4o-mini"
+user_provider = "openai"
+user_thinking = false
+policy_evaluator_model = "gpt-4o-mini"
+policy_evaluator_provider = "openai"
