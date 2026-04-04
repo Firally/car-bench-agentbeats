@@ -1,0 +1,32 @@
+{
+  manifest_version: "0.1.0",
+  program: {
+    image: "ghcr.io/firally/car-bench-agentbeats-car-bench-agent:latest",
+    entrypoint: ["uv", "run", "src/purple_car_bench_agent/server.py", "--host", "0.0.0.0", "--port", "9009"],
+    env: {
+      AGENT_LLM: "${config.agent_llm}",
+      OPENAI_API_KEY: "${config.openai_api_key}",
+      LOG_LEVEL: "INFO",
+    },
+    network: {
+      endpoints: [
+        { name: "endpoint", port: 9009 }
+      ]
+    }
+  },
+  config_schema: {
+    type: "object",
+    properties: {
+      agent_llm: { type: "string", default: "gpt-4o" },
+      openai_api_key: { type: "string", secret: true },
+    },
+    required: ["agent_llm", "openai_api_key"],
+    additionalProperties: false,
+  },
+  provides: {
+    a2a: { kind: "a2a", endpoint: "endpoint" }
+  },
+  exports: {
+    a2a: "a2a"
+  }
+}
