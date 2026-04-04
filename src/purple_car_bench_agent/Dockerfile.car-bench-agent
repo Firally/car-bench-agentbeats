@@ -18,6 +18,8 @@ RUN \
     --mount=type=cache,target=/home/agentbeats/.cache/uv,uid=1000 \
     uv sync --no-editable --frozen --extra car-bench-agent
 
+ENV UV_FROZEN=1
+
 ENTRYPOINT ["uv", "run", "src/purple_car_bench_agent/server.py"]
 CMD ["--host", "0.0.0.0"]
 EXPOSE 8080
