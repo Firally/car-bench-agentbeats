@@ -76,8 +76,39 @@ class CARBenchAgentExecutor(AgentExecutor):
                         system_prompt = parts[0].replace("System:", "").strip()
                         user_message_text = parts[1].strip()
                         if not messages:  # Only add system prompt once
-                            # Append minimal guidance after the original policies
-                            enhanced_prompt = system_prompt + "\n\nIMPORTANT: Only use tools and parameters that are explicitly available to you. If a required tool or parameter is missing, honestly tell the user you cannot perform that action. Never fabricate capabilities."
+                            # Append targeted guidance to reinforce most commonly violated policies
+                            enhanced_prompt = system_prompt + """
+
+CRITICAL EXECUTION CHECKLIST — follow these rules strictly on EVERY turn:
+
+### Tool & Parameter Integrity
+- ONLY use tools explicitly listed in your tool definitions. If a required tool is missing, tell the user honestly you cannot do it. NEVER fabricate tool calls or pretend to have capabilities you don't have.
+- ONLY use parameter values that match the tool's schema enum values exactly. For set_seat_heating: seat_zone must be one of "ALL_ZONES", "DRIVER", or "PASSENGER" — there is NO "DRIVER_REAR" or "PASSENGER_REAR" option.
+- If a required parameter value is unclear or ambiguous, ASK the user to clarify. Do NOT guess or assume.
+
+### Mandatory Pre-checks Before State Changes
+- BEFORE turning AC ON (set_air_conditioning on=true): You MUST first check all window positions. Close ANY window open more than 20%. Set fan_speed to at least 1 if currently 0. Do these BEFORE calling set_air_conditioning.
+- BEFORE activating window defrost for FRONT/ALL (set_window_defrost on=true): You MUST ensure fan_speed >= 2, airflow direction includes WINDSHIELD, and AC is ON. Check via get_climate_settings or set them yourself BEFORE defrost.
+- BEFORE enabling fog lights (set_fog_lights on=true): You MUST check exterior lights. Low beams MUST be ON (activate if not). High beams MUST be OFF (deactivate if on). Do these BEFORE fog lights.
+- BEFORE enabling high beams: Fog lights MUST be OFF first.
+- BEFORE opening sunroof: Check weather at current location first. Sunshade must be fully open (100%) or opened in parallel.
+
+### Navigation Rules
+- When presenting routes: ALWAYS mention if a route includes toll roads (includes_toll=true). This is mandatory per policy.
+- For multi-stop routes without user preference: use fastest route per segment, but INFORM user you chose fastest and ask if they want alternatives.
+- Present fastest and shortest routes in detail. For other alternatives, only mention the count.
+- If navigation is already active, use add/replace/delete waypoint tools — do NOT call set_new_navigation again.
+- Use navigation editing tools ONE AT A TIME in sequence, never in parallel.
+- Route start must always be current location.
+
+### Format & Communication
+- ALL times must be in 24-hour format (e.g., 14:30, not 2:30 PM).
+- Use metric system: kilometers, meters, Celsius.
+- Do NOT use markdown, lists, bold, or non-speakable characters — your output goes to text-to-speech.
+
+### Disambiguation
+- If the user's request is ambiguous, follow disambiguation priority: policy rules > explicit request > user preferences (retrieve via get_user_preferences) > heuristic defaults > context > ask user.
+- If two or more valid options remain after internal disambiguation, you MUST ask the user to choose. Do not pick for them."""
                             messages.append({"role": "system", "content": enhanced_prompt})
                     else:
                         # Regular user message

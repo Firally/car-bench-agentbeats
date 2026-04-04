@@ -6,6 +6,7 @@
     env: {
       AGENT_LLM: "${config.agent_llm}",
       OPENAI_API_KEY: "${config.openai_api_key}",
+      GEMINI_API_KEY: "${config.gemini_api_key}",
       LOG_LEVEL: "INFO",
     },
     network: {
@@ -17,10 +18,11 @@
   config_schema: {
     type: "object",
     properties: {
-      agent_llm: { type: "string", default: "gpt-4o" },
-      openai_api_key: { type: "string", secret: true },
+      agent_llm: { type: "string", default: "gemini/gemini-2.5-pro" },
+      openai_api_key: { type: "string", secret: true, default: "" },
+      gemini_api_key: { type: "string", secret: true, default: "" },
     },
-    required: ["agent_llm", "openai_api_key"],
+    required: ["agent_llm"],
     additionalProperties: false,
   },
   provides: {
