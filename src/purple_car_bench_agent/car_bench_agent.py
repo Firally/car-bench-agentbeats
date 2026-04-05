@@ -81,10 +81,12 @@ class CARBenchAgentExecutor(AgentExecutor):
 
 CRITICAL EXECUTION CHECKLIST — follow these rules strictly on EVERY turn:
 
-### Tool & Parameter Integrity
-- ONLY use tools explicitly listed in your tool definitions. If a required tool is missing, tell the user honestly you cannot do it. NEVER fabricate tool calls or pretend to have capabilities you don't have.
+### Tool & Parameter Integrity (HALLUCINATION PREVENTION)
+- ONLY use tools explicitly listed in your tool definitions. If a required tool is MISSING, tell the user you cannot perform this action. NEVER fabricate or invent tool calls.
+- ONLY use parameters explicitly listed in each tool's schema. If a parameter you need is MISSING from the schema, you CANNOT use that tool for this purpose — tell the user the specific capability is unavailable. Do NOT pass parameters that don't exist in the schema.
 - ONLY use parameter values that match the tool's schema enum values exactly. For set_seat_heating: seat_zone must be one of "ALL_ZONES", "DRIVER", or "PASSENGER" — there is NO "DRIVER_REAR" or "PASSENGER_REAR" option.
 - If a required parameter value is unclear or ambiguous, ASK the user to clarify. Do NOT guess or assume.
+- NEVER offer to do something you cannot actually do with available tools. If you cannot fulfill a request, say so clearly and stop.
 
 ### Mandatory Pre-checks Before State Changes
 - BEFORE turning AC ON (set_air_conditioning on=true): You MUST first check all window positions. Close ANY window open more than 20%. Set fan_speed to at least 1 if currently 0. Do these BEFORE calling set_air_conditioning.
@@ -108,7 +110,12 @@ CRITICAL EXECUTION CHECKLIST — follow these rules strictly on EVERY turn:
 
 ### Disambiguation
 - If the user's request is ambiguous, follow disambiguation priority: policy rules > explicit request > user preferences (retrieve via get_user_preferences) > heuristic defaults > context > ask user.
-- If two or more valid options remain after internal disambiguation, you MUST ask the user to choose. Do not pick for them."""
+- IMPORTANT: Before asking the user to clarify, FIRST check if the answer can be found internally — call get_user_preferences with the relevant category to see if the user has a saved preference. Only ask the user if no internal source resolves the ambiguity.
+- If two or more valid options remain after internal disambiguation, you MUST ask the user to choose. Do not pick for them.
+
+### Scope Control
+- Only perform actions the user explicitly requested. Do NOT proactively suggest or perform additional actions beyond what was asked.
+- If you successfully complete the user's request, respond with confirmation and stop. Do not offer further services unprompted."""
                             messages.append({"role": "system", "content": enhanced_prompt})
                     else:
                         # Regular user message
@@ -266,14 +273,17 @@ CRITICAL EXECUTION CHECKLIST — follow these rules strictly on EVERY turn:
                     break  # Success, exit retry loop
                 except Exception as retry_err:
                     error_str = str(retry_err).lower()
-                    if "rate_limit" in error_str or "rate limit" in error_str or "429" in error_str:
-                        wait_time = (attempt + 1) * 2  # 2s, 4s, 6s
+                    retryable = ("rate_limit" in error_str or "rate limit" in error_str or "429" in error_str
+                                 or "disconnect" in error_str or "connection" in error_str or "eof" in error_str
+                                 or "server" in error_str or "timeout" in error_str)
+                    if retryable:
+                        wait_time = (attempt + 1) * 3  # 3s, 6s, 9s
                         ctx_logger.warning(
-                            f"Rate limit hit, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})"
+                            f"Retryable error, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries}): {str(retry_err)[:100]}"
                         )
                         await asyncio.sleep(wait_time)
                     else:
-                        raise  # Non-rate-limit error, don't retry
+                        raise  # Non-retryable error
 
             if response is None:
                 raise Exception("Max retries exceeded due to rate limiting")
@@ -301,24 +311,53 @@ CRITICAL EXECUTION CHECKLIST — follow these rules strictly on EVERY turn:
                 reasoning_content=assistant_content.get("reasoning_content")
             )
 
+            # Validate tool calls against schema before sending
+            validated_tool_calls = []
+            hallucination_errors = []
+            if assistant_content.get("tool_calls") and tools:
+                tool_schema_map = {t["function"]["name"]: t["function"].get("parameters", {}) for t in tools}
+                for tc in assistant_content["tool_calls"]:
+                    tc_name = tc["function"]["name"]
+                    tc_args = json.loads(tc["function"]["arguments"])
+                    if tc_name not in tool_schema_map:
+                        hallucination_errors.append(f"Tool '{tc_name}' is not available.")
+                        continue
+                    schema = tool_schema_map[tc_name]
+                    schema_props = schema.get("properties", {})
+                    invalid_params = [p for p in tc_args if p not in schema_props]
+                    if invalid_params:
+                        hallucination_errors.append(f"Tool '{tc_name}' does not accept parameter(s): {', '.join(invalid_params)}.")
+                        continue
+                    validated_tool_calls.append(tc)
+            elif assistant_content.get("tool_calls"):
+                validated_tool_calls = assistant_content["tool_calls"]
+
+            if hallucination_errors:
+                # Replace tool calls with error message — tell the model to refuse
+                error_text = "I'm sorry, I cannot do that. " + " ".join(hallucination_errors) + " This capability is currently not available."
+                assistant_content["content"] = error_text
+                assistant_content["tool_calls"] = None
+                validated_tool_calls = []
+                ctx_logger.warning("Blocked hallucinated tool calls", errors=hallucination_errors)
+
             # Build proper A2A Message with Parts
             parts = []
-            
+
             # Add TextPart if there's content
             if assistant_content.get("content"):
                 parts.append(Part(root=TextPart(
                     kind="text",
                     text=assistant_content["content"]
                 )))
-            
-            # Add DataPart if there are tool calls
-            if assistant_content.get("tool_calls"):
+
+            # Add DataPart if there are validated tool calls
+            if validated_tool_calls and not hallucination_errors:
                 tool_calls_list = [
                     ToolCall(
                         tool_name=tc["function"]["name"],
                         arguments=json.loads(tc["function"]["arguments"]),
                     )
-                    for tc in assistant_content["tool_calls"]
+                    for tc in validated_tool_calls
                 ]
                 tool_calls_data = ToolCallsData(tool_calls=tool_calls_list)
                 parts.append(Part(root=DataPart(
@@ -337,7 +376,7 @@ CRITICAL EXECUTION CHECKLIST — follow these rules strictly on EVERY turn:
             if not parts:
                 parts.append(Part(root=TextPart(
                     kind="text",
-                    text=assistant_content.get("content", "")
+                    text=assistant_content.get("content") or ""
                 )))
             
             ctx_logger.debug(
