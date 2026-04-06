@@ -5,20 +5,20 @@ cmd = "python src/green_car_bench_agent/server.py --host 127.0.0.1 --port 8081"
 [[participants]]
 role = "agent"
 endpoint = "http://127.0.0.1:8080"
-cmd = "python src/purple_car_bench_agent/server.py --host 127.0.0.1 --port 8080 --agent-llm gpt-4o --temperature 0.0"
+cmd = "python src/purple_car_bench_agent/server.py --host 127.0.0.1 --port 8080 --agent-llm gemini/gemini-2.5-pro --temperature 0.0"
 
 [config]
 num_trials = 1
 task_split = "test"  # "train" or "test"
-# Larger test: 10 base + 5 hallucination + 5 disambiguation = 20 tasks
-tasks_base_num_tasks = 10
-tasks_hallucination_num_tasks = 5
-tasks_disambiguation_num_tasks = 5
+# Quick local test: 5 base + 3 hallucination + 3 disambiguation = 11 tasks
+tasks_base_num_tasks = 5
+tasks_hallucination_num_tasks = 3
+tasks_disambiguation_num_tasks = 3
 max_steps = 50
 
 # Green agent LLM settings (user simulator + policy evaluator)
-user_model = "gpt-4o-mini"
-user_provider = "openai"
+user_model = "gemini-2.5-flash"
+user_provider = "gemini"
 user_thinking = false
-policy_evaluator_model = "gpt-4o-mini"
-policy_evaluator_provider = "openai"
+policy_evaluator_model = "gemini-2.5-flash"
+policy_evaluator_provider = "gemini"

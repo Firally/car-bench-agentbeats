@@ -38,6 +38,137 @@ logger = configure_logger(role="agent", context="-")
 SYSTEM_PROMPT = """You are a helpful car voice assistant. Follow the policy and tool instructions provided."""
 
 
+def check_policy_violations(tool_calls: list[dict], previous_tool_names: list[str], current_tool_names: list[str]) -> list[str]:
+    """Check if tool calls would violate AUT-POL rules based on conversation history.
+
+    Returns a list of violation descriptions with remediation guidance.
+    """
+    violations = []
+
+    for tc in tool_calls:
+        tc_name = tc["function"]["name"]
+        tc_args = json.loads(tc["function"]["arguments"])
+
+        # AUT-POL:005 + AUT-POL:009 — Sunroof prerequisites
+        if tc_name == "open_close_sunroof" and tc_args.get("percentage", 0) != 0:
+            if "get_weather" not in previous_tool_names:
+                violations.append(
+                    "AUT-POL:009 VIOLATION: You must call get_weather for the current location BEFORE opening the sunroof. "
+                    "Call get_weather first, then open the sunroof on the next turn."
+                )
+            if "open_close_sunshade" not in current_tool_names:
+                violations.append(
+                    "AUT-POL:005 VIOLATION: The sunroof can only be opened if the sunshade is fully open or being opened in parallel. "
+                    "You must call open_close_sunshade(percentage=100) in the SAME turn as open_close_sunroof."
+                )
+
+        # AUT-POL:010 — Window defrost prerequisites
+        if tc_name == "set_window_defrost" and tc_args.get("on") is True:
+            if tc_args.get("defrost_window") in ("ALL", "FRONT"):
+                has_climate_check = "get_climate_settings" in previous_tool_names
+                has_manual_setup = (
+                    "set_fan_speed" in previous_tool_names
+                    and "set_fan_airflow_direction" in previous_tool_names
+                    and "set_air_conditioning" in previous_tool_names
+                )
+                if not has_climate_check and not has_manual_setup:
+                    violations.append(
+                        "AUT-POL:010 VIOLATION: Before activating front/all window defrost, you must first either: "
+                        "(a) call get_climate_settings to check current state, OR "
+                        "(b) call set_fan_speed (>=2), set_fan_airflow_direction (include WINDSHIELD), and set_air_conditioning (on). "
+                        "Do these prerequisite calls first, then activate defrost on the next turn."
+                    )
+
+        # AUT-POL:011 — AC prerequisites
+        if tc_name == "set_air_conditioning" and tc_args.get("on") is True:
+            has_climate_check = "get_climate_settings" in previous_tool_names
+            has_window_and_fan = (
+                "open_close_window" in previous_tool_names
+                and "set_fan_speed" in previous_tool_names
+            )
+            has_window_check = (
+                "get_vehicle_window_positions" in previous_tool_names
+                or "open_close_window" in previous_tool_names
+            )
+            if not has_climate_check and not has_window_and_fan and has_window_check:
+                violations.append(
+                    "AUT-POL:011 VIOLATION: Before turning AC on, you must first either: "
+                    "(a) call get_climate_settings, OR "
+                    "(b) call get_vehicle_window_positions to check windows, close any window open >20%, and set_fan_speed to at least 1. "
+                    "Do these prerequisite calls first."
+                )
+            # Also check: if no window check at all, we should still ensure it
+            if not has_climate_check and not has_window_and_fan and not has_window_check:
+                violations.append(
+                    "AUT-POL:011 VIOLATION: Before turning AC on, you must check window positions first. "
+                    "Call get_vehicle_window_positions (or get_climate_settings) to check state, "
+                    "then close any window open >20% and ensure fan_speed >= 1 before activating AC."
+                )
+
+        # AUT-POL:013 — Fog lights prerequisites
+        if tc_name == "set_fog_lights" and tc_args.get("on") is True:
+            has_lights_check = "get_exterior_lights_status" in previous_tool_names
+            has_manual_setup = (
+                "set_head_lights_low_beams" in previous_tool_names
+                and "set_head_lights_high_beams" in previous_tool_names
+            )
+            if not has_lights_check and not has_manual_setup:
+                violations.append(
+                    "AUT-POL:013 VIOLATION: Before activating fog lights, you must first either: "
+                    "(a) call get_exterior_lights_status to check current state, OR "
+                    "(b) call set_head_lights_low_beams(on=true) and set_head_lights_high_beams(on=false). "
+                    "Do these prerequisite calls first."
+                )
+            # Also check weather prerequisite for fog lights (LLM-POL:008)
+            if "get_weather" not in previous_tool_names:
+                violations.append(
+                    "LLM-POL:008 VIOLATION: Before activating fog lights, you must call get_weather to check "
+                    "current weather conditions. Call get_weather first, then enable fog lights on the next turn."
+                )
+
+        # AUT-POL:014 — High beams prerequisites
+        if tc_name == "set_head_lights_high_beams" and tc_args.get("on") is True:
+            has_lights_check = "get_exterior_lights_status" in previous_tool_names
+            has_fog_control = "set_fog_lights" in previous_tool_names
+            if not has_lights_check and not has_fog_control:
+                violations.append(
+                    "AUT-POL:014 VIOLATION: Before activating high beams, you must first either: "
+                    "(a) call get_exterior_lights_status to check fog lights, OR "
+                    "(b) call set_fog_lights(on=false). "
+                    "Do these prerequisite calls first."
+                )
+
+    # Check: If navigation was already set up (set_new_navigation called before),
+    # don't call set_new_navigation again — use editing tools instead
+    for tc in tool_calls:
+        tc_name = tc["function"]["name"]
+        if tc_name == "set_new_navigation" and "set_new_navigation" in previous_tool_names:
+            violations.append(
+                "NAVIGATION VIOLATION: Navigation is already active (set_new_navigation was called earlier). "
+                "To modify the route, use navigation editing tools: navigation_add_one_waypoint, "
+                "navigation_replace_one_waypoint, navigation_replace_final_destination, "
+                "navigation_delete_one_waypoint, navigation_delete_final_destination. "
+                "Do NOT call set_new_navigation again."
+            )
+
+    # TECH-AUT-POL:018 — Navigation editing tools parallel restriction
+    navigation_edit_tools = [
+        "navigation_add_one_waypoint",
+        "navigation_delete_final_destination",
+        "navigation_delete_one_waypoint",
+        "navigation_replace_final_destination",
+        "navigation_replace_one_waypoint",
+    ]
+    nav_edit_count = sum(1 for tc in tool_calls if tc["function"]["name"] in navigation_edit_tools)
+    if nav_edit_count > 1:
+        violations.append(
+            "TECH-AUT-POL:018 VIOLATION: Only one navigation editing tool can be used per turn. "
+            "Use navigation editing tools one at a time in sequence, not in parallel."
+        )
+
+    return violations
+
+
 class CARBenchAgentExecutor(AgentExecutor):
     """Executor for the CAR-bench purple agent using native tool calling."""
 
@@ -49,6 +180,7 @@ class CARBenchAgentExecutor(AgentExecutor):
         self.interleaved_thinking = interleaved_thinking  # Whether to use interleaved thinking
         self.ctx_id_to_messages: dict[str, list[dict]] = {}
         self.ctx_id_to_tools: dict[str, list[dict]] = {}
+        self.ctx_id_to_previous_tool_names: dict[str, list[str]] = {}  # Track all tool calls per context
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         inbound_message = context.message
@@ -84,34 +216,48 @@ CRITICAL EXECUTION CHECKLIST — follow these rules strictly on EVERY turn:
 ### Tool & Parameter Integrity (HALLUCINATION PREVENTION)
 - ONLY use tools explicitly listed in your tool definitions. If a required tool is MISSING, tell the user you cannot perform this action. NEVER fabricate or invent tool calls.
 - ONLY use parameters explicitly listed in each tool's schema. If a parameter you need is MISSING from the schema, you CANNOT use that tool for this purpose — tell the user the specific capability is unavailable. Do NOT pass parameters that don't exist in the schema.
-- ONLY use parameter values that match the tool's schema enum values exactly. For set_seat_heating: seat_zone must be one of "ALL_ZONES", "DRIVER", or "PASSENGER" — there is NO "DRIVER_REAR" or "PASSENGER_REAR" option.
+- ONLY use parameter values that match the tool's schema enum values exactly. Check the enum list carefully before every call. For set_seat_heating: seat_zone must be one of "ALL_ZONES", "DRIVER", or "PASSENGER" — there is NO "DRIVER_REAR" or "PASSENGER_REAR". For open_close_sunshade: percentage must be one of [0, 50, 100] — there is NO 40 or other value.
 - If a required parameter value is unclear or ambiguous, ASK the user to clarify. Do NOT guess or assume.
 - NEVER offer to do something you cannot actually do with available tools. If you cannot fulfill a request, say so clearly and stop.
+- When a tool result is missing expected data or returns empty/null fields, tell the user the information is currently unavailable. Do NOT make up data or ask the user for information that should come from the system.
 
 ### Mandatory Pre-checks Before State Changes
-- BEFORE turning AC ON (set_air_conditioning on=true): You MUST first check all window positions. Close ANY window open more than 20%. Set fan_speed to at least 1 if currently 0. Do these BEFORE calling set_air_conditioning.
+- BEFORE turning AC ON (set_air_conditioning on=true): You MUST first call get_vehicle_window_positions to check all windows. Close ANY window open more than 20%. Set fan_speed to at least 1. Do these checks in a PRIOR turn, then call set_air_conditioning in the NEXT turn.
 - BEFORE activating window defrost for FRONT/ALL (set_window_defrost on=true): You MUST ensure fan_speed >= 2, airflow direction includes WINDSHIELD, and AC is ON. Check via get_climate_settings or set them yourself BEFORE defrost.
-- BEFORE enabling fog lights (set_fog_lights on=true): You MUST check exterior lights. Low beams MUST be ON (activate if not). High beams MUST be OFF (deactivate if on). Do these BEFORE fog lights.
+- BEFORE enabling fog lights (set_fog_lights on=true): You MUST first call get_weather to check weather conditions AND call get_exterior_lights_status to check current light state. Low beams MUST be ON (activate if not). High beams MUST be OFF (deactivate if on). Do these in a PRIOR turn BEFORE fog lights.
 - BEFORE enabling high beams: Fog lights MUST be OFF first.
 - BEFORE opening sunroof: Check weather at current location first. Sunshade must be fully open (100%) or opened in parallel.
+- When the user says "all zones" or similar for climate controls, use "ALL_ZONES" as the zone parameter — do NOT set DRIVER and PASSENGER separately.
 
 ### Navigation Rules
-- When presenting routes: ALWAYS mention if a route includes toll roads (includes_toll=true). This is mandatory per policy.
-- For multi-stop routes without user preference: use fastest route per segment, but INFORM user you chose fastest and ask if they want alternatives.
-- Present fastest and shortest routes in detail. For other alternatives, only mention the count.
-- If navigation is already active, use add/replace/delete waypoint tools — do NOT call set_new_navigation again.
+- When presenting routes: ALWAYS mention if a route includes toll roads (includes_toll=true). Say "This route includes toll roads" or "This is a toll-free route". This is MANDATORY — never skip toll information.
+- Multi-stop route handling: When a route has multiple segments, present route options for EACH segment separately. If the user does not specify a preference, select the fastest route for each segment, but you MUST tell the user "I have selected the fastest route for this segment. Would you like to hear about alternative routes?" for EVERY segment.
+- Present the fastest and shortest routes with details (distance, duration, toll info). For other alternatives, mention only the count (e.g., "There are also 2 other routes available").
+- CRITICAL: If navigation is already active (you can check via get_current_navigation_state), you MUST use navigation editing tools (navigation_add_one_waypoint, navigation_replace_one_waypoint, navigation_replace_final_destination, navigation_delete_one_waypoint, navigation_delete_final_destination) to modify it. NEVER call set_new_navigation when navigation is already active.
 - Use navigation editing tools ONE AT A TIME in sequence, never in parallel.
 - Route start must always be current location.
 
-### Format & Communication
+### Calendar and Time Rules
 - ALL times must be in 24-hour format (e.g., 14:30, not 2:30 PM).
 - Use metric system: kilometers, meters, Celsius.
+- When looking up calendar events, use today's actual date. Do NOT ask the user what today's date is — you already know it from the system context.
+- When the user says "today", "tomorrow", "this week", calculate the actual date yourself.
+
+### Format & Communication
 - Do NOT use markdown, lists, bold, or non-speakable characters — your output goes to text-to-speech.
+- Keep responses concise and natural for voice interaction.
 
 ### Disambiguation
 - If the user's request is ambiguous, follow disambiguation priority: policy rules > explicit request > user preferences (retrieve via get_user_preferences) > heuristic defaults > context > ask user.
-- IMPORTANT: Before asking the user to clarify, FIRST check if the answer can be found internally — call get_user_preferences with the relevant category to see if the user has a saved preference. Only ask the user if no internal source resolves the ambiguity.
-- If two or more valid options remain after internal disambiguation, you MUST ask the user to choose. Do not pick for them.
+- ABSOLUTE RULE: Before asking the user to clarify or listing options, you MUST FIRST call get_user_preferences with the relevant category to check if the user has a stored preference. The user expects the assistant to already know their preferences. If you find a matching preference, apply it directly without asking. NEVER present multiple options to the user without checking preferences first.
+- This applies to ALL ambiguous settings: air circulation mode, seat heating level, temperature, radio station, navigation preferences, etc.
+- Example: if the user says "change the air circulation to my preferred mode", call get_user_preferences("air_circulation") FIRST, find the preferred mode, then set it directly. Do NOT list options.
+- Example: if the user says "set my preferred temperature", call get_user_preferences("climate") FIRST, then set the temperature.
+- If preferences are checked AND no matching preference exists, THEN ask the user to choose.
+
+### Confirmation Rules
+- Do NOT ask for confirmation unless the tool description explicitly starts with REQUIRES_CONFIRMATION. If the user explicitly asks for an action, PROCEED IMMEDIATELY — do the prerequisite checks and execute the action. Do not ask "Is that what you want?" or "Shall I proceed?" for explicit requests.
+- Example: if the user says "Turn on the AC and set fresh air mode", just do it — check windows, close them if needed, set fan, turn on AC, set air circulation. Do NOT ask "Is that what you want?" first.
 
 ### Scope Control
 - Only perform actions the user explicitly requested. Do NOT proactively suggest or perform additional actions beyond what was asked.
@@ -311,34 +457,109 @@ CRITICAL EXECUTION CHECKLIST — follow these rules strictly on EVERY turn:
                 reasoning_content=assistant_content.get("reasoning_content")
             )
 
-            # Validate tool calls against schema before sending
-            validated_tool_calls = []
-            hallucination_errors = []
-            if assistant_content.get("tool_calls") and tools:
-                tool_schema_map = {t["function"]["name"]: t["function"].get("parameters", {}) for t in tools}
-                for tc in assistant_content["tool_calls"]:
-                    tc_name = tc["function"]["name"]
-                    tc_args = json.loads(tc["function"]["arguments"])
-                    if tc_name not in tool_schema_map:
-                        hallucination_errors.append(f"Tool '{tc_name}' is not available.")
-                        continue
-                    schema = tool_schema_map[tc_name]
-                    schema_props = schema.get("properties", {})
-                    invalid_params = [p for p in tc_args if p not in schema_props]
-                    if invalid_params:
-                        hallucination_errors.append(f"Tool '{tc_name}' does not accept parameter(s): {', '.join(invalid_params)}.")
-                        continue
-                    validated_tool_calls.append(tc)
-            elif assistant_content.get("tool_calls"):
-                validated_tool_calls = assistant_content["tool_calls"]
-
-            if hallucination_errors:
-                # Replace tool calls with error message — tell the model to refuse
-                error_text = "I'm sorry, I cannot do that. " + " ".join(hallucination_errors) + " This capability is currently not available."
-                assistant_content["content"] = error_text
-                assistant_content["tool_calls"] = None
+            # Validate tool calls against schema and policies, with re-prompting loop
+            max_validation_retries = 2
+            for validation_attempt in range(max_validation_retries + 1):
                 validated_tool_calls = []
-                ctx_logger.warning("Blocked hallucinated tool calls", errors=hallucination_errors)
+                hallucination_errors = []
+                if assistant_content.get("tool_calls") and tools:
+                    tool_schema_map = {t["function"]["name"]: t["function"].get("parameters", {}) for t in tools}
+                    for tc in assistant_content["tool_calls"]:
+                        tc_name = tc["function"]["name"]
+                        # Fix dotted tool names (e.g. "navigation_tool.get_current_navigation_state" → "get_current_navigation_state")
+                        if "." in tc_name:
+                            tc_name = tc_name.split(".")[-1]
+                            tc["function"]["name"] = tc_name
+                        tc_args = json.loads(tc["function"]["arguments"])
+                        if tc_name not in tool_schema_map:
+                            hallucination_errors.append(f"Tool '{tc_name}' is not available.")
+                            continue
+                        schema = tool_schema_map[tc_name]
+                        schema_props = schema.get("properties", {})
+                        invalid_params = [p for p in tc_args if p not in schema_props]
+                        if invalid_params:
+                            hallucination_errors.append(f"Tool '{tc_name}' does not accept parameter(s): {', '.join(invalid_params)}.")
+                            continue
+                        # Validate enum values
+                        for param_name, param_value in tc_args.items():
+                            param_schema = schema_props.get(param_name, {})
+                            if "enum" in param_schema and param_value not in param_schema["enum"]:
+                                hallucination_errors.append(
+                                    f"Tool '{tc_name}' parameter '{param_name}' must be one of {param_schema['enum']}, got '{param_value}'."
+                                )
+                                break
+                        else:
+                            validated_tool_calls.append(tc)
+                elif assistant_content.get("tool_calls"):
+                    validated_tool_calls = assistant_content["tool_calls"]
+
+                if hallucination_errors:
+                    error_text = "I'm sorry, I cannot do that. " + " ".join(hallucination_errors) + " This capability is currently not available."
+                    assistant_content["content"] = error_text
+                    assistant_content["tool_calls"] = None
+                    validated_tool_calls = []
+                    ctx_logger.warning("Blocked hallucinated tool calls", errors=hallucination_errors)
+                    break  # Don't retry hallucination — just refuse
+
+                # Check AUT-POL policy violations on validated tool calls
+                if validated_tool_calls:
+                    previous_tool_names = self.ctx_id_to_previous_tool_names.get(context.context_id, [])
+                    current_tool_names = [tc["function"]["name"] for tc in validated_tool_calls]
+                    policy_violations = check_policy_violations(validated_tool_calls, previous_tool_names, current_tool_names)
+
+                    if policy_violations and validation_attempt < max_validation_retries:
+                        # Re-prompt the LLM with violation feedback
+                        violation_feedback = (
+                            "POLICY VIOLATION DETECTED — your tool calls would violate car policies. "
+                            "You MUST fix this before proceeding:\n" +
+                            "\n".join(f"- {v}" for v in policy_violations) +
+                            "\n\nPlease revise your response. Call the prerequisite tools first, "
+                            "or adjust your approach to comply with all policies."
+                        )
+                        ctx_logger.warning(
+                            f"Policy violation detected (attempt {validation_attempt + 1}), re-prompting",
+                            violations=policy_violations
+                        )
+                        # Add the failed assistant message + violation feedback to messages
+                        messages.append({
+                            "role": "assistant",
+                            "content": assistant_content.get("content"),
+                            "tool_calls": assistant_content.get("tool_calls"),
+                        })
+                        messages.append({"role": "user", "content": violation_feedback})
+
+                        # Re-call the LLM
+                        try:
+                            retry_response = completion(messages=messages, **completion_kwargs)
+                            llm_message = retry_response.choices[0].message
+                            assistant_content = llm_message.model_dump(exclude_unset=True)
+                            ctx_logger.info(
+                                f"Re-prompt response (attempt {validation_attempt + 2})",
+                                has_tool_calls=bool(assistant_content.get("tool_calls")),
+                                has_content=bool(assistant_content.get("content")),
+                            )
+                            # Remove the violation feedback from history (we don't want green agent to see it)
+                            messages.pop()  # Remove user violation feedback
+                            messages.pop()  # Remove failed assistant message
+                            continue  # Re-validate
+                        except Exception as e:
+                            ctx_logger.error(f"Re-prompt failed: {e}")
+                            messages.pop()
+                            messages.pop()
+                            break
+                    elif policy_violations:
+                        # Max retries exhausted — log but let it through (LLM may have fixed partially)
+                        ctx_logger.warning("Policy violations remain after re-prompting", violations=policy_violations)
+
+                break  # No violations or hallucinations, proceed
+
+            # Update previous tool names tracking
+            if validated_tool_calls:
+                if context.context_id not in self.ctx_id_to_previous_tool_names:
+                    self.ctx_id_to_previous_tool_names[context.context_id] = []
+                self.ctx_id_to_previous_tool_names[context.context_id].extend(
+                    tc["function"]["name"] for tc in validated_tool_calls
+                )
 
             # Build proper A2A Message with Parts
             parts = []
@@ -432,3 +653,5 @@ CRITICAL EXECUTION CHECKLIST — follow these rules strictly on EVERY turn:
             del self.ctx_id_to_messages[context.context_id]
         if context.context_id in self.ctx_id_to_tools:
             del self.ctx_id_to_tools[context.context_id]
+        if context.context_id in self.ctx_id_to_previous_tool_names:
+            del self.ctx_id_to_previous_tool_names[context.context_id]
