@@ -82,27 +82,23 @@ def check_policy_violations(tool_calls: list[dict], previous_tool_names: list[st
         # AUT-POL:011 — AC prerequisites
         if tc_name == "set_air_conditioning" and tc_args.get("on") is True:
             has_climate_check = "get_climate_settings" in previous_tool_names
-            has_window_and_fan = (
-                "open_close_window" in previous_tool_names
-                and "set_fan_speed" in previous_tool_names
-            )
             has_window_check = (
                 "get_vehicle_window_positions" in previous_tool_names
                 or "open_close_window" in previous_tool_names
             )
-            if not has_climate_check and not has_window_and_fan and has_window_check:
-                violations.append(
-                    "AUT-POL:011 VIOLATION: Before turning AC on, you must first either: "
-                    "(a) call get_climate_settings, OR "
-                    "(b) call get_vehicle_window_positions to check windows, close any window open >20%, and set_fan_speed to at least 1. "
-                    "Do these prerequisite calls first."
-                )
-            # Also check: if no window check at all, we should still ensure it
-            if not has_climate_check and not has_window_and_fan and not has_window_check:
+            has_fan_speed = "set_fan_speed" in previous_tool_names or "set_fan_speed" in current_tool_names
+            # Must have either climate check OR window check
+            if not has_climate_check and not has_window_check:
                 violations.append(
                     "AUT-POL:011 VIOLATION: Before turning AC on, you must check window positions first. "
                     "Call get_vehicle_window_positions (or get_climate_settings) to check state, "
                     "then close any window open >20% and ensure fan_speed >= 1 before activating AC."
+                )
+            # Must have fan_speed set (even if climate was checked, fan_speed could still be 0)
+            if not has_climate_check and not has_fan_speed:
+                violations.append(
+                    "AUT-POL:011 VIOLATION: Before turning AC on, fan_speed must be at least 1. "
+                    "Call set_fan_speed(level=1) or higher before activating AC."
                 )
 
         # AUT-POL:013 — Fog lights prerequisites
@@ -222,18 +218,24 @@ CRITICAL EXECUTION CHECKLIST — follow these rules strictly on EVERY turn:
 - When a tool result is missing expected data or returns empty/null fields, tell the user the information is currently unavailable. Do NOT make up data or ask the user for information that should come from the system.
 
 ### Mandatory Pre-checks Before State Changes
-- BEFORE turning AC ON (set_air_conditioning on=true): You MUST first call get_vehicle_window_positions to check all windows. Close ANY window open more than 20%. Set fan_speed to at least 1. Do these checks in a PRIOR turn, then call set_air_conditioning in the NEXT turn.
+- BEFORE turning AC ON (set_air_conditioning on=true): You MUST do ALL of the following in a PRIOR turn:
+  1. Call get_vehicle_window_positions (or get_climate_settings) to check windows
+  2. Close ANY window open more than 20% using open_close_window
+  3. Call set_fan_speed to set fan speed to at least 1 (MANDATORY even if you already checked climate — the fan MUST be on)
+  Then call set_air_conditioning in the NEXT turn after all prerequisites are done.
 - BEFORE activating window defrost for FRONT/ALL (set_window_defrost on=true): You MUST ensure fan_speed >= 2, airflow direction includes WINDSHIELD, and AC is ON. Check via get_climate_settings or set them yourself BEFORE defrost.
 - BEFORE enabling fog lights (set_fog_lights on=true): You MUST first call get_weather to check weather conditions AND call get_exterior_lights_status to check current light state. Low beams MUST be ON (activate if not). High beams MUST be OFF (deactivate if on). Do these in a PRIOR turn BEFORE fog lights.
 - BEFORE enabling high beams: Fog lights MUST be OFF first.
 - BEFORE opening sunroof: Check weather at current location first. Sunshade must be fully open (100%) or opened in parallel.
-- When the user says "all zones" or similar for climate controls, use "ALL_ZONES" as the zone parameter — do NOT set DRIVER and PASSENGER separately.
+- When setting climate controls for multiple zones (driver+passenger), prefer "ALL_ZONES" as the zone parameter — do NOT set DRIVER and PASSENGER separately when both should get the same value.
+- BEFORE adjusting seat heating, call get_seat_heating_level to check current levels. This ensures you know what to change.
 
 ### Navigation Rules
-- When presenting routes: ALWAYS mention if a route includes toll roads (includes_toll=true). Say "This route includes toll roads" or "This is a toll-free route". This is MANDATORY — never skip toll information.
-- Multi-stop route handling: When a route has multiple segments, present route options for EACH segment separately. If the user does not specify a preference, select the fastest route for each segment, but you MUST tell the user "I have selected the fastest route for this segment. Would you like to hear about alternative routes?" for EVERY segment.
+- TOLL ROADS (MANDATORY): For EVERY route you present or select, you MUST state whether it includes toll roads. Check the includes_toll field. Say "This route includes toll roads" or "This is a toll-free route". NEVER skip this — even when you proactively select a route.
+- ROUTE SELECTION NOTIFICATION (MANDATORY): When you proactively select a route (e.g., fastest) without the user explicitly choosing, you MUST say "I have selected the fastest route" (or whichever type) AND ask "Would you like to hear about alternative routes?" This applies to EVERY segment of a multi-stop route. NEVER silently pick a route.
 - Present the fastest and shortest routes with details (distance, duration, toll info). For other alternatives, mention only the count (e.g., "There are also 2 other routes available").
-- CRITICAL: If navigation is already active (you can check via get_current_navigation_state), you MUST use navigation editing tools (navigation_add_one_waypoint, navigation_replace_one_waypoint, navigation_replace_final_destination, navigation_delete_one_waypoint, navigation_delete_final_destination) to modify it. NEVER call set_new_navigation when navigation is already active.
+- NAVIGATION STATE: ALWAYS call get_current_navigation_state FIRST when the user asks about navigation or wants to modify it. This tells you if navigation is active, what the current route is, and what waypoints exist. If the user asks to "restart" or "resume" navigation, check the navigation state first — it may contain the previous route information.
+- ACTIVE NAVIGATION: If navigation is already active, you MUST use navigation editing tools (navigation_add_one_waypoint, navigation_replace_one_waypoint, navigation_replace_final_destination, navigation_delete_one_waypoint, navigation_delete_final_destination). NEVER call set_new_navigation when navigation is active — it will fail with an error.
 - Use navigation editing tools ONE AT A TIME in sequence, never in parallel.
 - Route start must always be current location.
 
@@ -256,8 +258,10 @@ CRITICAL EXECUTION CHECKLIST — follow these rules strictly on EVERY turn:
 - If preferences are checked AND no matching preference exists, THEN ask the user to choose.
 
 ### Confirmation Rules
-- Do NOT ask for confirmation unless the tool description explicitly starts with REQUIRES_CONFIRMATION. If the user explicitly asks for an action, PROCEED IMMEDIATELY — do the prerequisite checks and execute the action. Do not ask "Is that what you want?" or "Shall I proceed?" for explicit requests.
-- Example: if the user says "Turn on the AC and set fresh air mode", just do it — check windows, close them if needed, set fan, turn on AC, set air circulation. Do NOT ask "Is that what you want?" first.
+- If a tool description starts with REQUIRES_CONFIRMATION: you MUST tell the user what you are about to do and get explicit "yes" confirmation BEFORE calling that tool. For example, send_email requires confirmation — tell the user the recipient(s) and message content, then wait for "yes".
+- For all OTHER tools (without REQUIRES_CONFIRMATION): do NOT ask for confirmation. If the user explicitly asks for an action, PROCEED IMMEDIATELY — do the prerequisite checks and execute the action. Do not ask "Is that what you want?" or "Shall I proceed?".
+- Example: if the user says "Turn on the AC", just do the prerequisites and turn it on — no confirmation needed.
+- Example: if the user says "Send an email to Frank", you must compose the email, present it to the user, and wait for confirmation before calling send_email.
 
 ### Scope Control
 - Only perform actions the user explicitly requested. Do NOT proactively suggest or perform additional actions beyond what was asked.
